@@ -46,7 +46,8 @@ No API key, Docker, external database, or manual file preparation is required. T
 ├── /src/                       # Supporting modules
 │   ├── extract.py              # API extraction logic
 │   ├── transform.py            # Data cleaning and normalisation
-│   └── load.py                 # Deduplication, sorting, CSV persistence
+│   ├── load.py                 # Deduplication, sorting, CSV persistence
+│   └── analysis.py             # Analytical layer (standings, form, metrics)
 ├── /data/
 │   ├── /raw/                   # Raw JSON extracts per matchweek
 │   └── /processed/             # Processed analytical output (matches.csv)
@@ -89,34 +90,112 @@ Persists transformed data to `data/processed/matches.csv` with upsert semantics:
 - **Chronological sorting:** Output is sorted by matchweek and then by kickoff datetime, even though the date is stored in DD-MM-YYYY display format.
 - **Append-safe:** If `matches.csv` already exists, new data is merged with existing data rather than overwriting, ensuring previously loaded matchweeks are preserved.
 
+### Analyse (`src/analysis.py`)
+
+A pure, stateless analytical layer sitting between the stored CSV and the dashboard. It is imported by `app.py` (not by `etl.py`) and runs at render time, so re-slicing the data never requires re-running the ETL:
+
+- **Team-perspective reshaping:** `build_team_matches()` unpivots each match row into two team-level rows (home and away), each carrying `goals_for`, `goals_against`, `result` (W/D/L) and `points`. Every downstream metric is computed from this single reshaped frame.
+- **League table:** `compute_league_table()` aggregates team rows into standings (MP, W, D, L, GF, GA, GD, Pts) sorted by points, then goal difference, then goals for.
+- **Form and sequence metrics:** chronological form (`get_team_form`), overall and conditional points-per-game (`compute_ppg_metrics`, e.g. PPG after a win), bounce-back rate after a loss (`compute_bounce_back`), and a 3×3 result transition matrix `P(result_t | result_t-1)` (`compute_transition_matrix`).
+- **Team profiling:** goals scored/conceded trend (`compute_goals_trend`), clean sheet rate (`compute_clean_sheet_rate`), and a home vs away split (`compute_home_away_split`).
+- **Data quality summary:** `compute_data_quality()` surfaces matchweeks loaded, matches per matchweek (flagging any with fewer than 10 fixtures), missing values per column, and the latest `last_update` — exposing the pipeline's health directly in the dashboard.
+
 ### Data Flow Diagram
 
 ```
-OpenLigaDB API
-       │
-       ▼
-  ┌──────────┐     ┌───────────────────────┐
-  │ Extract  │────▶│  data/raw/             │
-  │          │     │  matchweek_N.json      │
-  └──────────┘     │  matchweek_state.json  │
-       │           └───────────────────────┘
-       ▼
-  ┌──────────┐
-  │Transform │  (filter, flatten, derive metrics)
-  └──────────┘
-       │
-       ▼
-  ┌──────────┐     ┌───────────────────────┐
-  │   Load   │────▶│  data/processed/      │
-  │          │     │  matches.csv          │
-  └──────────┘     └───────────────────────┘
-       │
-       ▼
-  ┌──────────┐
-  │ Streamlit│  (reads matches.csv, computes standings & charts)
-  │   App    │
-  └──────────┘
+  ┌─ BATCH ─ etl.py ──────────────────────────────────────────────┐
+  │                                                               │
+  │    OpenLigaDB API                                             │
+  │         │                                                     │
+  │         ▼                                                     │
+  │    ┌────────────┐     ┌────────────────────────┐              │
+  │    │  Extract   │────▶│  data/raw/             │              │
+  │    │ extract.py │     │  matchweek_N.json      │              │
+  │    └────────────┘     │  matchweek_state.json  │              │
+  │         │             └────────────────────────┘              │
+  │         ▼                                                     │
+  │    ┌────────────┐                                             │
+  │    │ Transform  │  filter unfinished, flatten nested payload, │
+  │    │transform.py│  derive result / total_goals / goal_diff    │
+  │    └────────────┘                                             │
+  │         │                                                     │
+  │         ▼                                                     │
+  │    ┌────────────┐     ┌────────────────────────┐              │
+  │    │    Load    │────▶│  data/processed/       │              │
+  │    │  load.py   │     │  matches.csv           │              │
+  │    └────────────┘     └────────────────────────┘              │
+  │                                  │                            │
+  └──────────────────────────────────┼────────────────────────────┘
+                                     │  matches.csv is the contract
+  ┌─ READ-TIME ─ app.py ─────────────┼────────────────────────────┐
+  │                                  ▼                            │
+  │    ┌────────────┐     ┌────────────────────────┐              │
+  │    │  Analysis  │◀────│  matches.csv           │              │
+  │    │ analysis.py│     └────────────────────────┘              │
+  │    └────────────┘                                             │
+  │         │  match rows ─▶ team rows ─▶ league table, form,     │
+  │         │  PPG, bounce-back, transition matrix, clean sheets, │
+  │         │  home/away split, data-quality summary              │
+  │         ▼                                                     │
+  │    ┌────────────┐                                             │
+  │    │ Streamlit  │  renders tables & charts,                   │
+  │    │   App      │  cached via st.cache_data                   │
+  │    └────────────┘                                             │
+  │                                                               │
+  └───────────────────────────────────────────────────────────────┘
 ```
+
+`etl.py` owns the batch half (Extract → Transform → Load) and writes `matches.csv`.
+`app.py` owns the read half: it loads that CSV once, hands it to `analysis.py`, and
+renders the returned frames. The two halves are decoupled — the dashboard can be
+restarted, re-filtered and re-rendered without issuing a single API call, and the
+analytical layer is pure (no I/O, no state), so every metric is reproducible from
+the CSV alone.
+
+### Control Flow Diagram: Incremental Extraction
+
+The data flow above shows *where data goes*. This diagram shows *how `extract()` decides what to fetch* — the one genuinely stateful, non-trivial part of the pipeline. A football season is a moving target: past matchweeks are immutable history, the current matchweek is a live document that changes several times a weekend, and future matchweeks do not exist yet. The extractor has to tell these three cases apart on every single run, using nothing but a small JSON ledger it wrote to itself last time.
+
+```mermaid
+flowchart TD
+    A([etl.py calls extract]) --> B["GET /getcurrentgroup/pl<br/>C = current live matchweek"]
+    B --> C{"matchweek_state.json<br/>exists on disk?"}
+    C -->|"No — cold start"| D["state = empty ledger<br/>all C matchweeks must be fetched"]
+    C -->|"Yes — warm start"| E["state = ledger of matchweeks<br/>already sealed as complete"]
+    D --> F
+    E --> F
+
+    F{{"for mw = 1 … C"}} --> G{"is mw marked<br/>complete in the ledger?"}
+    G -->|"No — never fetched, or<br/>fetched while still in play"| J
+    G -->|Yes| H{"mw == C ?<br/>is this the live round?"}
+    H -->|"No — frozen history"| I["SKIP<br/>no HTTP call, no disk write"]
+    H -->|"Yes — scores can still move"| J
+
+    J["GET /getmatchdata/pl/2026/mw"] --> K["overwrite data/raw/matchweek_mw.json<br/>newest snapshot wins"]
+    K --> L["all_matches.extend(matches)"]
+    L --> M{"is every match in mw<br/>flagged matchIsFinished?"}
+    M -->|No| O["ledger: mw = complete false<br/>re-fetched again on the next run"]
+    M -->|Yes| P["ledger: mw = complete true<br/>sealed once C moves past mw"]
+
+    I --> N
+    O --> N
+    P --> N
+    N(["next mw"]) --> F
+
+    F -->|"loop exhausted"| Q["write matchweek_state.json<br/>a single write, only after the whole loop"]
+    Q --> R([" return all_matches ➜ transform ➜ load "])
+```
+
+*(The diagram renders as a flowchart on GitHub and in any Mermaid-aware viewer.)*
+
+#### Why this is harder than it looks
+
+- **A matchweek has three states, not two.** *Unfetched*, *open* (fetched, but some fixtures unplayed) and *sealed* (all fixtures finished **and** the live pointer `C` has moved past it). Only the third state earns a skip. The ledger stores just one boolean, so the second condition — `mw != C` — has to be re-evaluated against the live API on every run; a matchweek that was sealed on Sunday is still re-read on Monday if the league has not rolled over yet.
+- **The live matchweek is deliberately re-fetched even when the ledger says complete.** The final whistle is not the last word: OpenLigaDB back-fills late results and pushes score corrections, bumping `lastUpdateDateTime` after the fact. Trusting the flag would freeze a provisional scoreline into `matches.csv`. The cost is exactly one redundant request per run; the benefit is never publishing a stale table.
+- **Idempotency has to hold at three layers, not one.** The raw JSON file is overwritten rather than appended, the accumulator returns only what was actually fetched this run, and the load step upserts on the natural key `(matchweek, home_team, away_team)` keeping the latest `last_update`. Running the ETL once or fifty times in a day produces a byte-identical `matches.csv`.
+- **Failure is atomic by construction.** The ledger is written **once**, after the loop completes. A network exception on matchweek 7 propagates out before that write, so nothing is sealed and the next run simply re-fetches from where the last successful ledger left off. A per-iteration write would risk sealing a matchweek whose JSON never reached disk.
+- **The payoff compounds across the season.** Without state, every run costs `C` requests and grows linearly to 38. With it, a steady-state run costs 2: one for the live pointer, one for the open matchweek. The current ledger shows matchweeks 1 and 2 sealed and matchweek 3 open — 2 API calls instead of 4, a gap that widens every week.
+- **The deliberate trade-off.** Nothing ever re-opens a sealed matchweek, so a retroactive correction to an old result is not picked up. This is accepted on purpose: such corrections are rare, and the escape hatch is cheap — delete `data/raw/matchweek_state.json` and the next run performs a full re-fetch, which the natural-key upsert in the load step makes completely safe.
 
 ---
 
