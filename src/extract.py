@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 import requests
 
@@ -7,6 +8,11 @@ BASE_URL = "https://api.openligadb.de"
 LEAGUE = "pl"
 SEASON = 2026
 
+# Give up on a request after 10 seconds instead of waiting forever,
+# and allow one retry in case the failure was a brief network blip
+TIMEOUT = 10
+RETRY_DELAY = 2
+
 # Paths are resolved from this file, not the working directory,
 # so the ETL can be run from anywhere
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,9 +20,26 @@ RAW_DIR = PROJECT_ROOT / "data" / "raw"
 STATE_FILE = RAW_DIR / "matchweek_state.json"
 
 
-# Call an OpenLigaDB endpoint and return the parsed JSON
+# Call an OpenLigaDB endpoint and return the parsed JSON.
+# raise_for_status() turns an error response (404, 500, 503) into an
+# exception, so an error page is never parsed as if it were match data
 def _get(endpoint):
-    return requests.get(f"{BASE_URL}/{endpoint}").json()
+    url = f"{BASE_URL}/{endpoint}"
+
+    try:
+        response = requests.get(url, timeout=TIMEOUT)
+        response.raise_for_status()
+
+    # Try once more before giving up; if the second attempt also fails,
+    # the exception is raised and the ETL stops
+    except requests.RequestException as error:
+        print(f"Request failed ({error}), retrying in {RETRY_DELAY}s...")
+        time.sleep(RETRY_DELAY)
+
+        response = requests.get(url, timeout=TIMEOUT)
+        response.raise_for_status()
+
+    return response.json()
 
 
 # Write data to disk as UTF-8 JSON
@@ -71,10 +94,11 @@ def extract():
         complete = all(match["matchIsFinished"] for match in matches)
         state[key] = {"complete": complete}
 
-        print(f"MW {matchweek}: {len(matches)} matches, complete = {complete}")
+        # Save the state after each matchweek, so that if a later matchweek
+        # fails the progress made so far is not lost on the next run
+        _write_json(STATE_FILE, state)
 
-    # Write the updated state back to disk
-    _write_json(STATE_FILE, state)
+        print(f"MW {matchweek}: {len(matches)} matches, complete = {complete}")
 
     print(f"\nTotal matches returned: {len(all_matches)}")
 

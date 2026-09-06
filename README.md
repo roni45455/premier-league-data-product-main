@@ -17,8 +17,8 @@ This project tracks the **Premier League 2026/2027 season** in near real-time. I
 ## How to Run
 
 ```bash
-git clone <repository-url>
-cd <repository-folder>
+git clone https://github.com/roni45455/premier-league-data-product-main.git
+cd premier-league-data-product-main
 python -m venv .venv
 
 # Windows
