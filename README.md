@@ -1,4 +1,4 @@
-# Premier League 2026/27 — Data Product
+# Premier League 2026/27 — Data Pipeline
 
 An end-to-end data product that extracts live Premier League match data from the OpenLigaDB API, transforms it into analytical outputs, and presents insights through an interactive Streamlit dashboard.
 
@@ -175,15 +175,6 @@ flowchart TD
 ```
 
 *(The diagram renders as a flowchart on GitHub and in any Mermaid-aware viewer.)*
-
-#### Why this is harder than it looks
-
-- **A matchweek has three states, not two.** *Unfetched*, *open* (fetched, but some fixtures unplayed) and *sealed* (all fixtures finished **and** the live pointer `C` has moved past it). Only the third state earns a skip. The ledger stores just one boolean, so the second condition — `mw != C` — has to be re-evaluated against the live API on every run; a matchweek that was sealed on Sunday is still re-read on Monday if the league has not rolled over yet.
-- **The live matchweek is deliberately re-fetched even when the ledger says complete.** The final whistle is not the last word: OpenLigaDB back-fills late results and pushes score corrections, bumping `lastUpdateDateTime` after the fact. Trusting the flag would freeze a provisional scoreline into `matches.csv`. The cost is exactly one redundant request per run; the benefit is never publishing a stale table.
-- **Idempotency has to hold at three layers, not one.** The raw JSON file is overwritten rather than appended, the accumulator returns only what was actually fetched this run, and the load step upserts on the natural key `(matchweek, home_team, away_team)` keeping the latest `last_update`. Running the ETL once or fifty times in a day produces a byte-identical `matches.csv`.
-- **Failure is atomic by construction.** The ledger is written **once**, after the loop completes. A network exception on matchweek 7 propagates out before that write, so nothing is sealed and the next run simply re-fetches from where the last successful ledger left off. A per-iteration write would risk sealing a matchweek whose JSON never reached disk.
-- **The payoff compounds across the season.** Without state, every run costs `C` requests and grows linearly to 38. With it, a steady-state run costs 2: one for the live pointer, one for the open matchweek. The current ledger shows matchweeks 1 and 2 sealed and matchweek 3 open — 2 API calls instead of 4, a gap that widens every week.
-- **The deliberate trade-off.** Nothing ever re-opens a sealed matchweek, so a retroactive correction to an old result is not picked up. This is accepted on purpose: such corrections are rare, and the escape hatch is cheap — delete `data/raw/matchweek_state.json` and the next run performs a full re-fetch, which the natural-key upsert in the load step makes completely safe.
 
 ---
 
