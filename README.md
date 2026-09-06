@@ -158,32 +158,20 @@ The data flow above shows *where data goes*. This diagram shows *how `extract()`
 
 ```mermaid
 flowchart TD
-    A([etl.py calls extract]) --> B["GET /getcurrentgroup/pl<br/>C = current live matchweek"]
-    B --> C{"matchweek_state.json<br/>exists on disk?"}
-    C -->|"No — cold start"| D["state = empty ledger<br/>all C matchweeks must be fetched"]
-    C -->|"Yes — warm start"| E["state = ledger of matchweeks<br/>already sealed as complete"]
-    D --> F
-    E --> F
+    A([extract]) --> B["GET /getcurrentgroup/pl<br/>C = current live matchweek"]
+    B --> C["read matchweek_state.json<br/>empty on the first run"]
+    C --> D{{"for mw = 1 … C"}}
 
-    F{{"for mw = 1 … C"}} --> G{"is mw marked<br/>complete in the ledger?"}
-    G -->|"No — never fetched, or<br/>fetched while still in play"| J
-    G -->|Yes| H{"mw == C ?<br/>is this the live round?"}
-    H -->|"No — frozen history"| I["SKIP<br/>no HTTP call, no disk write"]
-    H -->|"Yes — scores can still move"| J
+    D --> E{"mw sealed complete<br/>AND mw is not the live round C ?"}
+    E -->|"Yes — frozen history"| F["SKIP<br/>no API call, no disk write"]
+    E -->|"No — new, open, or live"| G["GET /getmatchdata/pl/2026/mw<br/>overwrite data/raw/matchweek_mw.json"]
+    G --> H["ledger: mw complete = are all<br/>matches in mw finished?"]
 
-    J["GET /getmatchdata/pl/2026/mw"] --> K["overwrite data/raw/matchweek_mw.json<br/>newest snapshot wins"]
-    K --> L["all_matches.extend(matches)"]
-    L --> M{"is every match in mw<br/>flagged matchIsFinished?"}
-    M -->|No| O["ledger: mw = complete false<br/>re-fetched again on the next run"]
-    M -->|Yes| P["ledger: mw = complete true<br/>sealed once C moves past mw"]
+    F --> D
+    H --> D
 
-    I --> N
-    O --> N
-    P --> N
-    N(["next mw"]) --> F
-
-    F -->|"loop exhausted"| Q["write matchweek_state.json<br/>a single write, only after the whole loop"]
-    Q --> R([" return all_matches ➜ transform ➜ load "])
+    D -->|"loop finished"| I["write matchweek_state.json<br/>one write, after the whole loop"]
+    I --> J([" all_matches ➜ transform ➜ load "])
 ```
 
 *(The diagram renders as a flowchart on GitHub and in any Mermaid-aware viewer.)*
